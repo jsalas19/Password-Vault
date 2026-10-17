@@ -1,13 +1,11 @@
-﻿mod gui;
+mod gui;
 
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     aes::cipher::InvalidLength,
     Aes256Gcm, Nonce,
 };
-use argon2::{
-    Algorithm, Argon2, Params, Version,
-};
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rand::{Rng, RngCore};
@@ -63,7 +61,11 @@ pub struct AddArgs {
     pub notes: Option<String>,
     #[arg(long, value_delimiter = ',', help = "Comma-separated tags")]
     pub tags: Vec<String>,
-    #[arg(long, default_value_t = 20, help = "Password length when auto-generating")]
+    #[arg(
+        long,
+        default_value_t = 20,
+        help = "Password length when auto-generating"
+    )]
     pub length: usize,
 }
 
@@ -179,6 +181,16 @@ pub struct StoredVault {
     pub salt: String,
     pub nonce: String,
     pub ciphertext: String,
+    #[serde(default)]
+    pub master_wrap_nonce: String,
+    #[serde(default)]
+    pub wrapped_data_key: String,
+    #[serde(default)]
+    pub recovery_salt: String,
+    #[serde(default)]
+    pub recovery_wrap_nonce: String,
+    #[serde(default)]
+    pub recovery_wrapped_data_key: String,
 }
 
 #[derive(Debug)]
@@ -263,7 +275,9 @@ pub fn run() -> Result<(), AppError> {
             gui::run_gui()?;
         }
         Commands::Tui => {
-            println!("TUI mode is planned for a future release. Use the CLI commands to manage your vault.");
+            println!(
+                "TUI mode is planned for a future release. Use the CLI commands to manage your vault."
+            );
         }
         Commands::Totp => {
             println!("TOTP support is planned for a future release.");
@@ -285,17 +299,67 @@ fn print_json<T: Serialize>(value: &T, json: bool) -> Result<(), AppError> {
 
 /// Creates a new encrypted vault file using the supplied master password.
 pub fn init_vault(master_password: &str, json: bool) -> Result<(), AppError> {
+    let recovery_key = create_vault(master_password)?;
+
+    let path = vault_path();
+    let payload = serde_json::json!({
+        "message": "Vault initialized",
+        "path": path.display().to_string(),
+        "recovery_key": recovery_key,
+        "warning": "Save this recovery key securely. It will not be shown again."
+    });
+    print_json(&payload, json)?;
+    Ok(())
+}
+
+/// Creates a new encrypted vault and returns its one-time recovery key.
+pub fn create_vault(master_password: &str) -> Result<String, AppError> {
     let path = vault_path();
     if path.exists() {
-        return Err(AppError(format!("Vault already exists at {}", path.display())));
+        return Err(AppError(format!(
+            "Vault already exists at {}",
+            path.display()
+        )));
     }
 
     let vault = VaultData::default();
-    save_vault(&vault, master_password)?;
+    let recovery_key = generate_recovery_key();
+    save_vault_with_recovery(&vault, master_password, &recovery_key)?;
+    Ok(recovery_key)
+}
 
-    let payload = serde_json::json!({ "message": "Vault initialized", "path": path.display().to_string() });
-    print_json(&payload, json)?;
+/// Creates and installs a recovery key for a legacy vault that is currently unlocked.
+pub fn enable_vault_recovery(master_password: &str) -> Result<String, AppError> {
+    let vault = load_vault(master_password)?;
+    let recovery_key = generate_recovery_key();
+    save_vault_with_recovery(&vault, master_password, &recovery_key)?;
+    Ok(recovery_key)
+}
+
+/// Unlocks a vault with its recovery key and encrypts it under a replacement master password.
+pub fn recover_vault(recovery_key: &str, new_master_password: &str) -> Result<(), AppError> {
+    if recovery_key.trim().is_empty() || new_master_password.trim().is_empty() {
+        return Err(AppError(
+            "Recovery key and new master password are required.".to_string(),
+        ));
+    }
+
+    let stored = read_stored_vault()?;
+    if stored.version != 2 || stored.recovery_wrapped_data_key.is_empty() {
+        return Err(AppError(
+            "This vault does not have a recovery key configured.".to_string(),
+        ));
+    }
+
+    let vault = decrypt_vault_with_recovery_key(&stored, recovery_key)?;
+    save_vault_with_recovery(&vault, new_master_password, recovery_key)?;
     Ok(())
+}
+
+/// Returns whether the existing encrypted vault has a configured recovery key.
+pub fn vault_has_recovery() -> Result<bool, AppError> {
+    let stored = read_stored_vault()?;
+    Ok(stored.version == 2 && !stored.recovery_wrapped_data_key.is_empty())
 }
 
 /// Adds a new entry to the vault after validating uniqueness and encrypting the updated vault.
@@ -305,7 +369,9 @@ pub fn add_entry(args: AddArgs, json: bool) -> Result<(), AppError> {
         return Err(AppError(format!("Entry '{}' already exists", args.name)));
     }
 
-    let password = args.password.unwrap_or_else(|| generate_password(args.length, true, false));
+    let password = args
+        .password
+        .unwrap_or_else(|| generate_password(args.length, true, false));
     let timestamp = current_timestamp();
     let entry = VaultEntry {
         id: uuid::Uuid::new_v4().to_string(),
@@ -322,7 +388,10 @@ pub fn add_entry(args: AddArgs, json: bool) -> Result<(), AppError> {
     vault.entries.push(entry.clone());
     save_vault(&vault, &args.master_password)?;
 
-    print_json(&serde_json::json!({ "message": "Entry added", "entry": entry }), json)?;
+    print_json(
+        &serde_json::json!({ "message": "Entry added", "entry": entry }),
+        json,
+    )?;
     Ok(())
 }
 
@@ -338,7 +407,13 @@ pub fn list_entries(args: ListArgs, json: bool) -> Result<(), AppError> {
             println!("No entries found");
         } else {
             for entry in filtered {
-                println!("{} | {} | {} | tags: {}", entry.name, entry.username, entry.url, entry.tags.join(", "));
+                println!(
+                    "{} | {} | {} | tags: {}",
+                    entry.name,
+                    entry.username,
+                    entry.url,
+                    entry.tags.join(", ")
+                );
             }
         }
     }
@@ -400,7 +475,10 @@ pub fn edit_entry(args: EditArgs, json: bool) -> Result<(), AppError> {
     vault.entries.push(entry.clone());
     save_vault(&vault, &args.master_password)?;
 
-    print_json(&serde_json::json!({ "message": "Entry updated", "entry": entry }), json)?;
+    print_json(
+        &serde_json::json!({ "message": "Entry updated", "entry": entry }),
+        json,
+    )?;
     Ok(())
 }
 
@@ -414,7 +492,10 @@ pub fn delete_entry(args: DeleteArgs, json: bool) -> Result<(), AppError> {
     }
 
     save_vault(&vault, &args.master_password)?;
-    print_json(&serde_json::json!({ "message": "Entry deleted", "name": args.name }), json)?;
+    print_json(
+        &serde_json::json!({ "message": "Entry deleted", "name": args.name }),
+        json,
+    )?;
     Ok(())
 }
 
@@ -452,30 +533,33 @@ pub fn import_vault(args: ImportArgs, json: bool) -> Result<(), AppError> {
     }
 
     save_vault(&vault, &args.master_password)?;
-    print_json(&serde_json::json!({ "message": "Import complete", "count": vault.entries.len() }), json)?;
+    print_json(
+        &serde_json::json!({ "message": "Import complete", "count": vault.entries.len() }),
+        json,
+    )?;
     Ok(())
 }
 
 /// Loads the encrypted vault from disk and decrypts it with the provided master password.
 fn load_vault(master_password: &str) -> Result<VaultData, AppError> {
-    let path = vault_path();
-    if !path.exists() {
-        return Err(AppError(format!("Vault does not exist at {}", path.display())));
-    }
-
-    let stored: StoredVault = serde_json::from_slice(&fs::read(path)?)?;
-    let key = derive_key(master_password, &base64_decode(&stored.salt)?);
-    let nonce_bytes = parse_nonce(&stored.nonce)?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(AppError::from)?;
-    let ciphertext = base64_decode(&stored.ciphertext)?;
-    let plaintext = cipher.decrypt(nonce, ciphertext.as_ref())?;
-    let vault: VaultData = serde_json::from_slice(&plaintext)?;
-    Ok(vault)
+    let stored = read_stored_vault()?;
+    decrypt_vault_with_master(&stored, master_password)
 }
 
 /// Saves the in-memory vault to disk by encrypting it with a fresh random salt and nonce.
 fn save_vault(vault: &VaultData, master_password: &str) -> Result<(), AppError> {
+    let path = vault_path();
+    if path.exists() {
+        let existing = read_stored_vault()?;
+        if existing.version == 2 {
+            return save_vault_with_recovery_wrapper(vault, master_password, existing);
+        }
+    }
+
+    save_legacy_vault(vault, master_password)
+}
+
+fn save_legacy_vault(vault: &VaultData, master_password: &str) -> Result<(), AppError> {
     let dir = vault_dir();
     fs::create_dir_all(&dir)?;
 
@@ -492,10 +576,166 @@ fn save_vault(vault: &VaultData, master_password: &str) -> Result<(), AppError> 
         salt: BASE64.encode(&salt),
         nonce: BASE64.encode(nonce.as_slice()),
         ciphertext: BASE64.encode(ciphertext),
+        master_wrap_nonce: String::new(),
+        wrapped_data_key: String::new(),
+        recovery_salt: String::new(),
+        recovery_wrap_nonce: String::new(),
+        recovery_wrapped_data_key: String::new(),
     };
 
-    fs::write(vault_path(), serde_json::to_string_pretty(&stored)?)?;
+    write_stored_vault(&stored)
+}
+
+fn save_vault_with_recovery(
+    vault: &VaultData,
+    master_password: &str,
+    recovery_key: &str,
+) -> Result<(), AppError> {
+    let stored = encrypt_vault_with_recovery(vault, master_password, recovery_key)?;
+    write_stored_vault(&stored)
+}
+
+fn encrypt_vault_with_recovery(
+    vault: &VaultData,
+    master_password: &str,
+    recovery_key: &str,
+) -> Result<StoredVault, AppError> {
+    let mut master_salt = [0u8; 16];
+    let mut recovery_salt = [0u8; 16];
+    OsRng.fill_bytes(&mut master_salt);
+    OsRng.fill_bytes(&mut recovery_salt);
+
+    let mut data_key = [0u8; 32];
+    OsRng.fill_bytes(&mut data_key);
+    let data_nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let data_cipher = Aes256Gcm::new_from_slice(&data_key).map_err(AppError::from)?;
+    let plaintext = serde_json::to_vec(vault)?;
+    let ciphertext = data_cipher.encrypt(&data_nonce, plaintext.as_ref())?;
+
+    let master_key = derive_key(master_password, &master_salt);
+    let master_nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let master_cipher = Aes256Gcm::new_from_slice(&master_key).map_err(AppError::from)?;
+    let wrapped_data_key = master_cipher.encrypt(&master_nonce, data_key.as_ref())?;
+
+    let recovery_key_derived = derive_key(recovery_key, &recovery_salt);
+    let recovery_nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let recovery_cipher =
+        Aes256Gcm::new_from_slice(&recovery_key_derived).map_err(AppError::from)?;
+    let recovery_wrapped_data_key = recovery_cipher.encrypt(&recovery_nonce, data_key.as_ref())?;
+
+    Ok(StoredVault {
+        version: 2,
+        salt: BASE64.encode(master_salt),
+        nonce: BASE64.encode(data_nonce.as_slice()),
+        ciphertext: BASE64.encode(ciphertext),
+        master_wrap_nonce: BASE64.encode(master_nonce.as_slice()),
+        wrapped_data_key: BASE64.encode(wrapped_data_key),
+        recovery_salt: BASE64.encode(recovery_salt),
+        recovery_wrap_nonce: BASE64.encode(recovery_nonce.as_slice()),
+        recovery_wrapped_data_key: BASE64.encode(recovery_wrapped_data_key),
+    })
+}
+
+fn save_vault_with_recovery_wrapper(
+    vault: &VaultData,
+    master_password: &str,
+    mut stored: StoredVault,
+) -> Result<(), AppError> {
+    let master_key = derive_key(master_password, &base64_decode(&stored.salt)?);
+    let master_nonce = parse_nonce(&stored.master_wrap_nonce)?;
+    let master_cipher = Aes256Gcm::new_from_slice(&master_key).map_err(AppError::from)?;
+    let wrapped_key = base64_decode(&stored.wrapped_data_key)?;
+    let mut data_key = master_cipher
+        .decrypt(Nonce::from_slice(&master_nonce), wrapped_key.as_ref())
+        .map_err(|_| AppError("Could not unlock the vault data key.".to_string()))?;
+
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let data_cipher = Aes256Gcm::new_from_slice(&data_key).map_err(AppError::from)?;
+    let plaintext = serde_json::to_vec(vault)?;
+    let ciphertext = data_cipher.encrypt(&nonce, plaintext.as_ref())?;
+    stored.nonce = BASE64.encode(nonce.as_slice());
+    stored.ciphertext = BASE64.encode(ciphertext);
+    data_key.fill(0);
+    write_stored_vault(&stored)
+}
+
+fn write_stored_vault(stored: &StoredVault) -> Result<(), AppError> {
+    let dir = vault_dir();
+    fs::create_dir_all(&dir)?;
+    fs::write(vault_path(), serde_json::to_string_pretty(stored)?)?;
     Ok(())
+}
+
+fn read_stored_vault() -> Result<StoredVault, AppError> {
+    let path = vault_path();
+    if !path.exists() {
+        return Err(AppError(format!(
+            "Vault does not exist at {}",
+            path.display()
+        )));
+    }
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn decrypt_vault_with_master(
+    stored: &StoredVault,
+    master_password: &str,
+) -> Result<VaultData, AppError> {
+    let master_key = derive_key(master_password, &base64_decode(&stored.salt)?);
+    let data_key = if stored.version == 1 {
+        master_key
+    } else if stored.version == 2 {
+        let nonce = parse_nonce(&stored.master_wrap_nonce)?;
+        let cipher = Aes256Gcm::new_from_slice(&master_key).map_err(AppError::from)?;
+        let wrapped_key = base64_decode(&stored.wrapped_data_key)?;
+        let key = cipher
+            .decrypt(Nonce::from_slice(&nonce), wrapped_key.as_ref())
+            .map_err(|_| AppError("Incorrect master password or damaged vault.".to_string()))?;
+        let key: [u8; 32] = key
+            .try_into()
+            .map_err(|_| AppError("Invalid encrypted vault key.".to_string()))?;
+        key
+    } else {
+        return Err(AppError(format!(
+            "Unsupported vault version: {}",
+            stored.version
+        )));
+    };
+
+    decrypt_vault_data(stored, &data_key)
+}
+
+fn decrypt_vault_with_recovery_key(
+    stored: &StoredVault,
+    recovery_key: &str,
+) -> Result<VaultData, AppError> {
+    let recovery_key_derived = derive_key(recovery_key, &base64_decode(&stored.recovery_salt)?);
+    let nonce = parse_nonce(&stored.recovery_wrap_nonce)?;
+    let cipher = Aes256Gcm::new_from_slice(&recovery_key_derived).map_err(AppError::from)?;
+    let wrapped_key = base64_decode(&stored.recovery_wrapped_data_key)?;
+    let data_key = cipher
+        .decrypt(Nonce::from_slice(&nonce), wrapped_key.as_ref())
+        .map_err(|_| AppError("Incorrect recovery key or damaged vault.".to_string()))?;
+    let data_key: [u8; 32] = data_key
+        .try_into()
+        .map_err(|_| AppError("Invalid encrypted vault key.".to_string()))?;
+    decrypt_vault_data(stored, &data_key)
+}
+
+fn decrypt_vault_data(stored: &StoredVault, data_key: &[u8; 32]) -> Result<VaultData, AppError> {
+    let nonce = parse_nonce(&stored.nonce)?;
+    let cipher = Aes256Gcm::new_from_slice(data_key).map_err(AppError::from)?;
+    let ciphertext = base64_decode(&stored.ciphertext)?;
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        .map_err(|_| AppError("Unable to decrypt vault data.".to_string()))?;
+    Ok(serde_json::from_slice(&plaintext)?)
+}
+
+fn generate_recovery_key() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    BASE64.encode(bytes)
 }
 
 /// Derives an AES key from the master password and random salt using the Argon2id KDF.
@@ -503,7 +743,9 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
     let params = Params::new(65536, 3, 1, Some(32)).expect("valid Argon2 params");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = [0u8; 32];
-    argon2.hash_password_into(password.as_bytes(), salt, &mut key).unwrap();
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .unwrap();
     key
 }
 
@@ -545,12 +787,20 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
 }
 
 /// Filters the vault entries by optional tag and text query parameters.
-fn filter_entries(entries: Vec<VaultEntry>, tag: Option<&str>, query: Option<&str>) -> Vec<VaultEntry> {
+fn filter_entries(
+    entries: Vec<VaultEntry>,
+    tag: Option<&str>,
+    query: Option<&str>,
+) -> Vec<VaultEntry> {
     entries
         .into_iter()
         .filter(|entry| {
             if let Some(tag_value) = tag {
-                if !entry.tags.iter().any(|entry_tag| entry_tag.eq_ignore_ascii_case(tag_value)) {
+                if !entry
+                    .tags
+                    .iter()
+                    .any(|entry_tag| entry_tag.eq_ignore_ascii_case(tag_value))
+                {
                     return false;
                 }
             }
@@ -708,5 +958,64 @@ mod tests {
         let decoded: VaultData = serde_json::from_slice(&serialized).unwrap();
         assert_eq!(decoded.entries.len(), 1);
         assert_eq!(decoded.entries[0].name, "GitHub");
+    }
+
+    #[test]
+    fn recovery_key_can_reset_master_password() {
+        let vault = VaultData {
+            entries: vec![VaultEntry {
+                id: "test".to_string(),
+                name: "Example".to_string(),
+                username: "user".to_string(),
+                password: "secret".to_string(),
+                url: "https://example.com".to_string(),
+                notes: String::new(),
+                tags: vec![],
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            }],
+        };
+        let recovery_key = generate_recovery_key();
+        let original = encrypt_vault_with_recovery(&vault, "old master", &recovery_key).unwrap();
+
+        assert_eq!(
+            decrypt_vault_with_master(&original, "old master")
+                .unwrap()
+                .entries,
+            vault.entries
+        );
+        assert_eq!(
+            decrypt_vault_with_recovery_key(&original, &recovery_key)
+                .unwrap()
+                .entries,
+            vault.entries
+        );
+        assert!(decrypt_vault_with_recovery_key(&original, "incorrect key").is_err());
+
+        let recovered = decrypt_vault_with_recovery_key(&original, &recovery_key).unwrap();
+        let reset = encrypt_vault_with_recovery(&recovered, "new master", &recovery_key).unwrap();
+        assert!(decrypt_vault_with_master(&reset, "old master").is_err());
+        assert_eq!(
+            decrypt_vault_with_master(&reset, "new master")
+                .unwrap()
+                .entries,
+            vault.entries
+        );
+        assert_eq!(
+            decrypt_vault_with_recovery_key(&reset, &recovery_key)
+                .unwrap()
+                .entries,
+            vault.entries
+        );
+    }
+
+    #[test]
+    fn legacy_vault_metadata_remains_readable() {
+        let stored: StoredVault = serde_json::from_str(
+            r#"{"version":1,"salt":"salt","nonce":"nonce","ciphertext":"ciphertext"}"#,
+        )
+        .unwrap();
+        assert_eq!(stored.version, 1);
+        assert!(stored.recovery_wrapped_data_key.is_empty());
     }
 }

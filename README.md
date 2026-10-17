@@ -11,6 +11,7 @@ RustVault is a local password vault written in Rust. It provides a desktop GUI a
 - Import and export entries as JSON or CSV
 - Launch the desktop GUI directly, or use the CLI for scripts and terminal workflows
 - Encrypt the vault file with AES-256-GCM using a key derived from the master password with Argon2id
+- Recover access to a vault with its separately stored recovery key and choose a new master password
 
 ## Requirements
 
@@ -118,6 +119,14 @@ The encrypted vault file is named `rustvault.json` and is stored in the `.vault`
 The vault contents are encrypted at rest with AES-256-GCM. Argon2id derives the encryption key from the master password and a random salt; each save uses a fresh salt and nonce.
 
 **Keep your master password safe.** It is required to decrypt the vault and cannot be recovered by RustVault. CLI examples pass it as a command-line argument, which may be visible in shell history or process listings; use the GUI or take appropriate precautions when entering it.
+
+### Recovery key
+
+New vaults have a randomly generated recovery key. The GUI displays it once when creating a vault; copy it and store it somewhere secure and separate from your computer. Existing vaults created by an older version can get a recovery key from **Set up recovery** after unlocking. The CLI `init` command also prints the recovery key once.
+
+If you forget the master password, open the GUI, choose **Forgot master password? Use recovery key**, enter your saved recovery key, then enter and confirm a new master password. The vault is re-encrypted with the new master password. The recovery key remains valid, so keep it secure. Anyone with the recovery key can access the vault and change its master password.
+
+Recovery keys are not stored in recoverable form in the vault file. If both the master password and recovery key are lost, the vault contents cannot be recovered. Back up the encrypted vault file before making changes.
 
 JSON and CSV exports are **unencrypted** and contain the vault data in readable form. Store exported files securely and remove them when no longer needed.
 
